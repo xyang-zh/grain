@@ -2,12 +2,13 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     execute,
+    cursor,
 };
 use ratatui::{
     backend::CrosstermBackend,
     layout::Rect,
     text::{Line, Span, Text},
-    widgets::Paragraph,
+    widgets::{Paragraph, Clear},
     Frame, Terminal,
     style::{Color, Style}
 };
@@ -165,32 +166,55 @@ fn crop_line_for_scroll(line: &str, scroll_x: u16) -> String {
     let mut visual_pos = 0;
     
     for c in line.chars() {
+        if c == '\x1b' {
+            in_escape = true;
+            escape_buffer.clear();
+            escape_buffer.push(c);
+            continue;
+        }
+        
         if in_escape {
             escape_buffer.push(c);
             if c == 'm' {
                 in_escape = false;
-                result.push_str(&escape_buffer);
-                escape_buffer.clear();
+                if visual_pos >= scroll_x_usize || !result.is_empty() {
+                    result.push_str(&escape_buffer);
+                }
             }
-        } else if c == '\x1b' {
-            in_escape = true;
-            escape_buffer.push(c);
-        } else {
-            if visual_pos >= scroll_x_usize {
-                result.push(c);
+            continue;
+        }
+        
+        if visual_pos >= scroll_x_usize {
+            result.push(c);
+        }
+        visual_pos += 1;
+    }
+    
+    if result.is_empty() {
+        return String::new();
+    }
+    
+    if !result.ends_with("\x1b[0m") {
+        let mut open_escapes = 0;
+        let mut in_esc = false;
+        
+        for c in result.chars() {
+            if c == '\x1b' {
+                in_esc = true;
+                open_escapes += 1;
+            } else if in_esc && c == 'm' {
+                open_escapes -= 1;
+                if open_escapes == 0 {
+                    in_esc = false;
+                }
             }
-            visual_pos += 1;
+        }
+        
+        if open_escapes > 0 {
+            result.push_str("\x1b[0m");
         }
     }
     
-    if in_escape {
-        result.push_str(&escape_buffer);
-    }
-    
-    if result.is_empty() && !line.is_empty() {
-        return " ".to_string();
-    }
-
     result
 }
 
@@ -216,7 +240,7 @@ fn read_content(config: &AppConfig) -> io::Result<Vec<String>> {
                 Ok(None) => {
                     if start_time.elapsed() > timeout {
                         let _ = child.kill();
-                        std::thread::sleep(Duration::from_millis(50));
+                        let _ = child.wait();
                         break;
                     }
                     
@@ -248,6 +272,10 @@ fn read_content(config: &AppConfig) -> io::Result<Vec<String>> {
                     lines.push(format!("\x1b[31m{}\x1b[0m", line));
                 }
             }
+        }
+        
+        if start_time.elapsed() > timeout {
+            lines.push("\x1b[33m[超时] 进程已被强制终止\x1b[0m".to_string());
         }
         
         if lines.is_empty() {
@@ -299,6 +327,7 @@ struct DisplayState {
     scroll_x: u16,
     content: Vec<String>,
     last_update: Instant,
+    last_render: Instant,
 }
 
 impl DisplayState {
@@ -308,9 +337,10 @@ impl DisplayState {
             scroll_x: 0,
             content: Vec::new(),
             last_update: Instant::now(),
+            last_render: Instant::now(),
         }
     }
-    
+
     fn update_content(&mut self, new_content: Vec<String>, width: u16, height: u16) {
         if new_content != self.content {
             let max_scroll_y = new_content.len().saturating_sub(height as usize) as u16;
@@ -341,8 +371,11 @@ impl DisplayState {
         
         for line in &self.content[start_y..end_y] {
             let cropped_line = crop_line_for_scroll(line, self.scroll_x);
-            
-            let line_str = cropped_line.to_string();
+            let line_str = if cropped_line.is_empty() {
+                "".to_string()
+            } else {
+                cropped_line
+            };
             lines.push(Line::from(line_str));
         }
         
@@ -418,16 +451,17 @@ impl DisplayState {
         }
     }
     
-    fn should_update(&mut self, interval: Duration) -> bool {
+    fn mark_rendered(&mut self) {
+        self.last_render = Instant::now();
+    }
+
+    fn should_update(&self, interval: Duration) -> bool {
         let now = Instant::now();
-        let time_since_last_update = now.duration_since(self.last_update);
-        
-        if time_since_last_update >= interval {
-            self.last_update += interval;
-            true
-        } else {
-            false
-        }
+        now.duration_since(self.last_update) >= interval
+    }
+    
+    fn mark_updated(&mut self) {
+        self.last_update = Instant::now();
     }
 }
 
@@ -467,9 +501,9 @@ fn get_status_line(config: &AppConfig, _state: &DisplayState, width: u16, _heigh
 fn render_ui(frame: &mut Frame, config: &AppConfig, state: &DisplayState) {
     let full_area = frame.size();
     
+    frame.render_widget(Clear, full_area);
+    
     const STATUS_HEIGHT: u16 = 1;
-    const SEPARATOR_HEIGHT: u16 = 1;
-    const MIN_HEIGHT: u16 = STATUS_HEIGHT + SEPARATOR_HEIGHT + 1;
 
     let status_area = if full_area.height >= STATUS_HEIGHT {
         Some(Rect {
@@ -482,20 +516,7 @@ fn render_ui(frame: &mut Frame, config: &AppConfig, state: &DisplayState) {
         None
     };
 
-    let separator_area = if full_area.height >= MIN_HEIGHT {
-        Some(Rect {
-            x: 0,
-            y: STATUS_HEIGHT,
-            width: full_area.width,
-            height: SEPARATOR_HEIGHT,
-        })
-    } else {
-        None
-    };
-
-    let (content_y, content_height) = if full_area.height >= MIN_HEIGHT {
-        (STATUS_HEIGHT + SEPARATOR_HEIGHT, full_area.height - STATUS_HEIGHT - SEPARATOR_HEIGHT)
-    } else if full_area.height >= STATUS_HEIGHT + 1 {
+    let (content_y, content_height) = if full_area.height >= STATUS_HEIGHT + 1 {
         (STATUS_HEIGHT, full_area.height - STATUS_HEIGHT)
     } else {
         (0, 1)
@@ -513,11 +534,6 @@ fn render_ui(frame: &mut Frame, config: &AppConfig, state: &DisplayState) {
         frame.render_widget(Paragraph::new(status_line), area);
     }
 
-    if let Some(area) = separator_area {
-        let separator_line = Line::from("");
-        frame.render_widget(Paragraph::new(separator_line), area);
-    }
-
     let display_text = state.get_display_text(content_area.width, content_area.height);
     let paragraph = Paragraph::new(display_text);
     frame.render_widget(paragraph, content_area);
@@ -528,18 +544,26 @@ fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
 
     let mut stdout = io::stdout();
     
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        cursor::Hide
+    )?;
     
     let backend = CrosstermBackend::new(stdout);
     Terminal::new(backend)
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        cursor::Show
+    )?;
+    
     disable_raw_mode()?;
     
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    
-    terminal.show_cursor()
+    Ok(())
 }
 
 fn add_panic() {
@@ -548,7 +572,11 @@ fn add_panic() {
     panic::set_hook(Box::new(move |panic_info| {
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen);
+        let _ = execute!(
+            stdout,
+            LeaveAlternateScreen,
+            cursor::Show
+        );
         
         orig_hook(panic_info);
     }));
@@ -577,13 +605,21 @@ impl App {
     
     fn run(&mut self) -> io::Result<()> {
         loop {
-            if self.state.should_update(self.config.interval) {
+            let now = Instant::now();
+            let time_since_last_update = now.duration_since(self.state.last_update);
+            let time_until_next_update = if time_since_last_update >= self.config.interval {
+                Duration::from_millis(0)
+            } else {
+                self.config.interval - time_since_last_update
+            };
+            
+            let poll_timeout = time_until_next_update.min(Duration::from_millis(100));
+            
+            if time_since_last_update >= self.config.interval {
                 match read_content(&self.config) {
                     Ok(new_content) => {
                         let size = self.terminal.size()?;
-                        let content_height = if size.height >= 3 {
-                            size.height - 2
-                        } else if size.height >= 2 {
+                        let content_height = if size.height >= 2 {
                             size.height - 1
                         } else {
                             1
@@ -595,36 +631,57 @@ impl App {
                         self.state.content = vec![format!("读取失败: {}", e)];
                     }
                 }
+                self.state.mark_updated();
             }
             
             self.terminal.draw(|frame| {
                 render_ui(frame, &self.config, &self.state);
             })?;
-
-            let poll_timeout = self.config.interval
-                .checked_sub(Instant::now().duration_since(self.state.last_update))
-                .unwrap_or(Duration::from_millis(100))
-                .min(Duration::from_millis(100));
-
+            self.state.mark_rendered();
+            
             if event::poll(poll_timeout)? {
-                if let Event::Key(key_event) = event::read()? {
-                    let is_ctrl_c = key_event.modifiers.contains(KeyModifiers::CONTROL) 
-                        && key_event.code == KeyCode::Char('c');
-                    
-                    if is_ctrl_c || key_event.code == KeyCode::Char('q') {
-                        break;
-                    }
+                match event::read()? {
+                    Event::Key(key_event) => {
+                        let is_ctrl_c = key_event.modifiers.contains(KeyModifiers::CONTROL) 
+                            && key_event.code == KeyCode::Char('c');
+                        
+                        if is_ctrl_c || key_event.code == KeyCode::Char('q') {
+                            break;
+                        }
 
-                    let size = self.terminal.size()?;
-                    let content_height = if size.height >= 3 {
-                        size.height - 2
-                    } else if size.height >= 2 {
-                        size.height - 1
-                    } else {
-                        1
-                    };
-                    let content_width = size.width;
-                    self.state.handle_key_event(&key_event, content_width, content_height);
+                        let size = self.terminal.size()?;
+                        let content_height = if size.height >= 2 {
+                            size.height - 1
+                        } else {
+                            1
+                        };
+                        let content_width = size.width;
+                        let handled = self.state.handle_key_event(&key_event, content_width, content_height);
+                        
+                        if handled {
+                            self.terminal.draw(|frame| {
+                                render_ui(frame, &self.config, &self.state);
+                            })?;
+                        }
+                    }
+                    
+                    Event::Resize(new_width, new_height) => {
+                        let content_height = if new_height >= 2 {
+                            new_height - 1
+                        } else {
+                            1
+                        };
+                        let content_width = new_width;
+                        self.state.update_content(
+                            self.state.content.clone(),
+                            content_width,
+                            content_height
+                        );
+                        self.terminal.draw(|frame| {
+                            render_ui(frame, &self.config, &self.state);
+                        })?;
+                    }
+                    _ => {}
                 }
             }
         }
